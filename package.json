@@ -1,0 +1,21 @@
+{
+  "name": "near-contract",
+  "version": "1.0.0",
+  "main": "index.js",
+  "repository": "https://gitlab.com/iwpa/near-contract.git",
+  "author": "smtkirapratik <samet.mollaoglu@kirapratik.com>",
+  "license": "MIT",
+  "scripts": {
+    "build:release": "asb",
+      "deploy": "near dev-deploy build/release/near-contract.wasm",
+      "dev": "yarn build:release && yarn deploy",
+      "test": "asp",
+      "clean": "rm -rf ./build && rm -rf ./neardev"
+  },
+  "dependencies": {
+    "@assemblyscript/loader": "^0.18.32"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.18.32"
+  }
+}
