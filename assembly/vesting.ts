@@ -27,14 +27,14 @@ export class VestingSchedule {
   unlockRate: u32;
   isRevocable: boolean;
   revoked: boolean;
-  cliffAndVestingAllocation: u32; // Total amount of tokens to be released at the end of the vesting cliff + vesting
-  vestingAllocation: u32; // Total amount of tokens to be released at the end of the vesting only vesting
+  cliffAndVestingAllocation: u128; // Total amount of tokens to be released at the end of the vesting cliff + vesting
+  vestingAllocation: u128; // Total amount of tokens to be released at the end of the vesting only vesting
   tgeVested: boolean;
   releasedPeriod: u32;
   icoType: u32;
-  investedUSDT: u32;
+  investedUSDT: u128;
   isClaimed: boolean;
-  tokenAbsoluteUsdtPrice: u32;
+  tokenAbsoluteUsdtPrice: u128;
 
   constructor() {
     this.revoked = false;
@@ -47,6 +47,11 @@ export class VestingSchedule {
 export function setCrowdsaleAddress(_address: string): void {
   _onlyOwner("setCrowdsaleAddress");
   storage.set("crowdsale-address", _address);
+}
+
+export function setTokenAddress(_address: string): void {
+  _onlyOwner("setTokenAddress");
+  storage.set("token-address", _address);
 }
 
 export function claimAsToken(_icoType: u32): void {
@@ -74,14 +79,49 @@ export function claimAsToken(_icoType: u32): void {
 
   assert(state != 1, "ERROR at claimAsToken: Sale round is currently stopped.");
 
-  var releasableAmount = u32(_getReleasableAmount(beneficiary, _icoType));
+  var releasableAmount = u128.from(_getReleasableAmount(beneficiary, _icoType));
   assert(
-    releasableAmount > 0,
+    releasableAmount > u128.Zero,
     "ERROR at claimAsToken: Releasable amount is 0."
   );
 
   _processPurchaseToken(beneficiary, _icoType, releasableAmount);
   increaseICOtokenSoldCall(releasableAmount, _icoType);
+}
+
+export function revoke(_beneficiaryAddress: string, _icoType: u32): void {
+  _onlyOwner("revoke");
+
+  var vestingKeyString = _beneficiaryAddress.concat(_icoType.toString());
+
+  var vesting = vestingSchedules.getSome(vestingKeyString);
+
+  assert(
+    vesting.isRevocable,
+    "ERROR at revoke: Target schedule is not revokable."
+  );
+  assert(
+    !vesting.revoked,
+    "ERROR at revoke: Vesting Schedule has already revoked."
+  );
+
+  var state = icoStates.getSome(_icoType);
+
+  assert(state != 1, "ERROR at claimAsToken: Sale round is currently stopped.");
+
+  var releasableAmount = u128.from(
+    _getReleasableAmount(_beneficiaryAddress, _icoType)
+  );
+
+  assert(
+    releasableAmount > u128.Zero,
+    "ERROR at claimAsToken: Releasable amount is 0."
+  );
+
+  _processPurchaseToken(_beneficiaryAddress, _icoType, releasableAmount);
+  increaseICOtokenSoldCall(releasableAmount, _icoType);
+  vesting.revoked = true;
+  vestingSchedules.set(vestingKeyString, vesting);
 }
 
 /**
@@ -91,14 +131,14 @@ export function claimAsToken(_icoType: u32): void {
 export function createVestingSchedule(
   _beneficiaryAddress: string,
   _icoType: u32,
-  _allocation: u32,
+  _allocation: u128,
   _numberOfCliffMonths: u32,
   _numberOfVestingMonths: u32,
   _unlockRate: u32,
   _isRevocable: boolean,
-  _investedUsdt: u32,
+  _investedUsdt: u128,
   _icoStartDate: u64,
-  _tokenAbsoluteUsdtPrice: u32
+  _tokenAbsoluteUsdtPrice: u128
 ): void {
   _onlyCrowdsaleContract("createVestingSchedule");
 
@@ -106,7 +146,10 @@ export function createVestingSchedule(
 
   var newVestingSchedule = new VestingSchedule();
 
-  var vestingAllocation = _allocation - (_unlockRate * _allocation) / 100;
+  var vestingAllocation = u128.sub(
+    _allocation,
+    u128.div(u128.mul(u128.from(_unlockRate), _allocation), u128.from(100))
+  );
 
   newVestingSchedule.beneficiaryAddress = _beneficiaryAddress;
   newVestingSchedule.icoType = _icoType;
@@ -125,9 +168,9 @@ export function createVestingSchedule(
 
 export function updateVestingSchedule(
   _vestingKeyString: string,
-  _tokenAmount: u32,
-  _totalVestingAllocation: u32,
-  _usdtAmount: u32
+  _tokenAmount: u128,
+  _totalVestingAllocation: u128,
+  _usdtAmount: u128
 ): void {
   _onlyCrowdsaleContract("updateVestingSchedule");
 
@@ -142,9 +185,15 @@ export function updateVestingSchedule(
   var vesting = vestingSchedules.getSome(_vestingKeyString);
 
   logging.log("varmis");
-  vesting.cliffAndVestingAllocation += _tokenAmount; //cliffAndVestingAllocation
-  vesting.vestingAllocation += _totalVestingAllocation; //vestingAllocation
-  vesting.investedUSDT += _usdtAmount; //investedUSDT
+  vesting.cliffAndVestingAllocation = u128.add(
+    vesting.cliffAndVestingAllocation,
+    _tokenAmount
+  ); //cliffAndVestingAllocation
+  vesting.vestingAllocation = u128.add(
+    vesting.vestingAllocation,
+    _totalVestingAllocation
+  ); //vestingAllocation
+  vesting.investedUSDT = u128.add(vesting.investedUSDT, _usdtAmount); //investedUSDT
   logging.log("varmis2");
   vestingSchedules.set(_vestingKeyString, vesting);
 }
@@ -180,8 +229,6 @@ function _getReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
     "ERROR at getReleasableAmount: ICO is not started yet"
   );
 
-  var releasableAmount: f64 = 0;
-
   var elapsedMonthNumber = _getElapsedMonth(vesting.icoStartDate, currentTime);
 
   if (elapsedMonthNumber > vesting.numberOfVesting + vesting.numberOfCliff) {
@@ -189,16 +236,13 @@ function _getReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
 
     //bu değerin true olması için token dağıtımından emin olunmalı
     vesting.isClaimed = true;
-  } else if (elapsedMonthNumber < vesting.numberOfCliff) {
-    return 0;
   }
 
-  var vestedMonthNumber =
-    elapsedMonthNumber - vesting.numberOfCliff - vesting.releasedPeriod;
+  var releasableAmount: f64 = 0;
 
   if (!vesting.tgeVested) {
     var unlockAmount = f64.div(
-      vesting.cliffAndVestingAllocation * vesting.unlockRate,
+      vesting.cliffAndVestingAllocation.toF64() * vesting.unlockRate,
       100
     );
 
@@ -206,15 +250,20 @@ function _getReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
     vesting.tgeVested = true;
   }
 
-  if (vestedMonthNumber > 0) {
+  if (elapsedMonthNumber > vesting.numberOfCliff + vesting.releasedPeriod) {
+    var vestedMonthNumber =
+      elapsedMonthNumber - vesting.numberOfCliff - vesting.releasedPeriod;
+
     var vestedAmount =
-      f64.div(vesting.vestingAllocation, vesting.numberOfVesting) *
+      f64.div(vesting.vestingAllocation.toF64(), vesting.numberOfVesting) *
       vestedMonthNumber;
 
     releasableAmount += vestedAmount;
     vesting.releasedPeriod += vestedMonthNumber;
   }
+
   vestingSchedules.set(vestingKeyString, vesting);
+
   return releasableAmount;
 }
 
@@ -229,10 +278,12 @@ function _getTimeAsSeconds(): u64 {
 function _processPurchaseToken(
   _beneficiary: string,
   _icoType: u32,
-  _releasableAmount: u32
+  _releasableAmount: u128
 ): void {
-  //token.transferFrom(owner(), _beneficiary, _releasableAmount);
-  //emit tokenClaimed(_beneficiary, _icoType, _releasableAmount);
+  var beneficiary: String = _beneficiary;
+  var releasableAmount: u128 = u128.from(_releasableAmount);
+
+  ft_transferCall(beneficiary, releasableAmount, "memo: String");
 }
 
 function _onlyOwner(funcName: string): void {
@@ -249,7 +300,20 @@ function _onlyCrowdsaleContract(funcName: string): void {
   );
   assert(
     Context.predecessor == crowdsaleContractAddress,
-    funcName + "method is private. Only crowdsale contract call this function."
+    funcName +
+      "method is private. Only crowdsale contract can call this function."
+  );
+}
+
+function _onlyOwnerOrBeneficiary(
+  funcName: string,
+  _beneficiaryAddress: string
+): void {
+  assert(
+    Context.predecessor == Context.contractName ||
+      Context.predecessor == _beneficiaryAddress,
+    funcName +
+      "method is private. Only owner or beneficiary can call this function."
   );
 }
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -263,6 +327,8 @@ export function getVestingScheduleStagesUI(
   _beneficiaryAddress: string,
   _icoType: u32
 ): Array<Array<f64>> {
+  _onlyOwnerOrBeneficiary("getVestingScheduleStagesUI", _beneficiaryAddress);
+
   var vestingKeyString = _beneficiaryAddress.concat(_icoType.toString());
 
   assert(
@@ -274,12 +340,12 @@ export function getVestingScheduleStagesUI(
   var dateTimestamp = f64(vesting.icoStartDate);
 
   var cliffTokenAllocation = f64.div(
-    vesting.cliffAndVestingAllocation * vesting.unlockRate,
+    vesting.cliffAndVestingAllocation.toF64() * vesting.unlockRate,
     100
   );
 
   var cliffUsdtAllocation = f64.div(
-    cliffTokenAllocation * vesting.tokenAbsoluteUsdtPrice,
+    cliffTokenAllocation * vesting.tokenAbsoluteUsdtPrice.toF64(),
     10 ** 6
   );
 
@@ -295,12 +361,12 @@ export function getVestingScheduleStagesUI(
   dateTimestamp += 30 * f64(DAY) * vesting.numberOfCliff;
 
   var tokenAmountAfterCliff = f64.div(
-    vesting.vestingAllocation,
+    vesting.vestingAllocation.toF64(),
     vesting.numberOfVesting
   );
 
   var usdtAmountAfterCliff = f64.div(
-    vesting.investedUSDT - cliffUsdtAllocation,
+    vesting.investedUSDT.toF64() - cliffUsdtAllocation,
     vesting.numberOfVesting
   );
 
@@ -350,6 +416,7 @@ export function getVestingSchedule(
   logging.log(vesting.tokenAbsoluteUsdtPrice);
 }
 export function viewReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
+  _onlyOwnerOrBeneficiary("getVestingScheduleStagesUI", _beneficiary);
   var vestingKeyString = _beneficiary.concat(_icoType.toString());
 
   assert(
@@ -375,30 +442,30 @@ export function viewReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
 
   if (elapsedMonthNumber > vesting.numberOfVesting + vesting.numberOfCliff) {
     elapsedMonthNumber = vesting.numberOfVesting + vesting.numberOfCliff;
-  } else if (elapsedMonthNumber < vesting.numberOfCliff) {
-    return 0;
   }
-
-  var vestedMonthNumber =
-    elapsedMonthNumber - vesting.numberOfCliff - vesting.releasedPeriod;
 
   var releasableAmount: f64 = 0;
 
   if (!vesting.tgeVested) {
     var unlockAmount = f64.div(
-      vesting.cliffAndVestingAllocation * vesting.unlockRate,
+      vesting.cliffAndVestingAllocation.toF64() * vesting.unlockRate,
       100
     );
 
     releasableAmount += unlockAmount;
   }
-  if (vestedMonthNumber > 0) {
+
+  if (elapsedMonthNumber > vesting.numberOfCliff + vesting.releasedPeriod) {
+    var vestedMonthNumber =
+      elapsedMonthNumber - vesting.numberOfCliff - vesting.releasedPeriod;
+
     var vestedAmount =
-      f64.div(vesting.vestingAllocation, vesting.numberOfVesting) *
+      f64.div(vesting.vestingAllocation.toF64(), vesting.numberOfVesting) *
       vestedMonthNumber;
 
     releasableAmount += vestedAmount;
   }
+
   return releasableAmount;
 }
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -407,10 +474,10 @@ export function viewReleasableAmount(_beneficiary: string, _icoType: u32): f64 {
 ////////////////////////////////////////////////////////////////////////////////////
 @nearBindgen
 class increaseICOtokenSoldCallArgs {
-  constructor(public _amount: u32, public _icoType: u32) {}
+  constructor(public _amount: u128, public _icoType: u32) {}
 }
 
-function increaseICOtokenSoldCall(_amount: u32, _icoType: u32): void {
+function increaseICOtokenSoldCall(_amount: u128, _icoType: u32): void {
   assert(Context.prepaidGas >= 20 * TGAS, "Please attach at least 20 Tgas");
   const crowdsaleContractAddress: string = storage.getPrimitive<string>(
     "crowdsale-address",
@@ -441,6 +508,69 @@ function increaseICOtokenSoldCall(_amount: u32, _icoType: u32): void {
 // Public callback
 export function increaseICOtokenSoldCallCallback(): bool {
   _onlyOwner("increaseICOtokenSoldCallCallback");
+
+  const results = ContractPromise.getResults();
+  assert(results.length == 1, "This is a callback method");
+
+  const response = results[0];
+
+  if (response.status == XCC_SUCCESS) {
+    // `set_greeting` succeeded
+    return true;
+  } else {
+    // it failed
+    return false;
+  }
+}
+////////////////////////////////////////////////////////////////////////////////////
+
+//ft_transferCall claimastoken fonksiyonundan token contractına token transferi için istek burada atılır
+////////////////////////////////////////////////////////////////////////////////////
+@nearBindgen
+class ft_transferCallArgs {
+  constructor(
+    public receiver_id: String,
+    public amount: u128,
+    public memo: String
+  ) {}
+}
+
+function ft_transferCall(
+  receiver_id: String,
+  amount: u128,
+  memo: String
+): void {
+  assert(Context.prepaidGas >= 20 * TGAS, "Please attach at least 20 Tgas");
+  const tokenContractAddress: string = storage.getPrimitive<string>(
+    "token-address",
+    ""
+  );
+  const args: ft_transferCallArgs = new ft_transferCallArgs(
+    receiver_id,
+    u128.mul(amount, u128.from(10 ** 6)),
+    memo
+  );
+  const promise: ContractPromise = ContractPromise.create(
+    tokenContractAddress,
+    "ft_transfer",
+    args,
+    5 * TGAS,
+    NO_DEPOSIT
+  );
+  // Create a promise to callback, needs 5 Tgas
+  const callbackPromise = promise.then(
+    Context.contractName,
+    "ft_transferCallCallback",
+    "{}",
+    5 * TGAS,
+    NO_DEPOSIT
+  );
+
+  callbackPromise.returnAsResult();
+}
+// Public callback
+export function ft_transferCallCallback(): bool {
+  _onlyOwner("ft_transferCallCallback");
 
   const results = ContractPromise.getResults();
   assert(results.length == 1, "This is a callback method");

@@ -5,6 +5,7 @@ import {
   Context,
   u128,
   PersistentMap,
+  ContractPromiseResult,
 } from "near-sdk-as";
 
 export const TGAS: u64 = 1000000000000;
@@ -15,7 +16,7 @@ export const ICODatas = new PersistentMap<u32, ICOData>("ICOData"); //icotype ->
 export const isIcoMember = new PersistentMap<string, boolean>("isIcoMember"); //address+icotype -> boolean
 export const icoMembers = new PersistentMap<u32, string[]>("icoMembers"); //icotype -> addresses[]
 
-export const whitelist = new PersistentMap<u32, string[]>("whitelist");
+export const whitelist = new PersistentMap<u32, string[]>("whitelist"); //icotype -> addresses[]
 
 enum IcoStates {
   active = 0, //(0)
@@ -26,28 +27,32 @@ enum IcoStates {
 @nearBindgen
 export class ICOData {
   ICOname: string;
-  ICOsupply: u32;
-  ICOusdtRaised: u32;
-  ICOtokenAllocated: u32;
-  ICOtokenSold: u32;
+  ICOsupply: u128; //display formatında
+  ICOusdtRaised: u128;
+  ICOtokenAllocated: u128;
+  ICOtokenSold: u128;
   ICOstate: IcoStates;
   ICOnumberOfCliff: u32;
   ICOnumberOfVesting: u32;
   ICOunlockRate: u32;
   ICOstartDate: u64;
-  TokenAbsoluteUsdtPrice: u32;
+  TokenAbsoluteUsdtPrice: u128; //absolute formatında
   IsFree: boolean;
   isOnlyWhitelist: boolean;
 
   constructor() {
-    this.ICOusdtRaised = 0;
-    this.ICOtokenAllocated = 0;
-    this.ICOtokenSold = 0;
+    this.ICOusdtRaised = u128.Zero;
+    this.ICOtokenAllocated = u128.Zero;
+    this.ICOtokenSold = u128.Zero;
     this.ICOstate = IcoStates.nonActive;
   }
 }
 
-export function initFunc(vestingAddress: string): void {
+export function initFunc(
+  vestingAddress: string,
+  tokenAddress: string,
+  usdtAddress: string
+): void {
   logging.log("initfuncttt");
   _onlyOwner("init");
 
@@ -56,11 +61,26 @@ export function initFunc(vestingAddress: string): void {
   storage.set<bool>("init", true);
 
   storage.set("vesting-address", vestingAddress);
+  storage.set("token-address", tokenAddress);
+  storage.set("usdt-address", usdtAddress);
+
+  storage.set<u128>("totalLeftover", u128.Zero);
+  storage.set<u128>("totalAllocation", u128.Zero);
 }
 
 export function setVestingAddress(_address: string): void {
   _onlyOwner("setVestingAddress");
   storage.set("vesting-address", _address);
+}
+
+export function setTokenAddress(_address: string): void {
+  _onlyOwner("setTokenAddress");
+  storage.set("token-address", _address);
+}
+
+export function setUSDTAddress(_address: string): void {
+  _onlyOwner("setUSDTAddress");
+  storage.set("usdt-address", _address);
 }
 
 export function changeIcoState(_icoType: u32, _icoState: u32): void {
@@ -72,26 +92,28 @@ export function changeIcoState(_icoType: u32, _icoState: u32): void {
   changeIcoStateInVestingCall(_icoType, _icoState);
 
   if (icoData.ICOstate == IcoStates.done) {
-    var saleLeftover = icoData.ICOsupply - icoData.ICOtokenAllocated;
+    var saleLeftover = u128.sub(icoData.ICOsupply, icoData.ICOtokenAllocated);
 
-    icoData.ICOsupply -= saleLeftover;
+    icoData.ICOsupply = u128.sub(icoData.ICOsupply, saleLeftover);
 
-    var totalLeftover =
-      storage.getPrimitive<u32>("totalLeftover", 0) + saleLeftover;
+    var totalLeftover = u128.add(
+      storage.getSome<u128>("totalLeftover"),
+      saleLeftover
+    );
 
-    storage.set<u32>("totalLeftover", totalLeftover);
+    storage.set<u128>("totalLeftover", totalLeftover);
   }
   ICODatas.set(_icoType, icoData);
 }
 
 export function increaseIcoSupplyWithLeftover(
   _icoType: u32,
-  _amount: u32
+  _amount: u128
 ): void {
   _onlyOwner("increaseIcoSupplyWithLeftover");
 
   var ICOData = ICODatas.getSome(_icoType);
-  var totalLeftover = storage.getPrimitive<u32>("totalLeftover", 0);
+  var totalLeftover = storage.getSome<u128>("totalLeftover");
 
   assert(
     ICOData.ICOstate != 2,
@@ -103,21 +125,21 @@ export function increaseIcoSupplyWithLeftover(
     "ERROR at increaseIcoSupplyWithLeftover: Not enough leftover."
   );
 
-  ICOData.ICOsupply += _amount;
+  ICOData.ICOsupply = u128.add(ICOData.ICOsupply, _amount);
   ICODatas.set(_icoType, ICOData);
 
-  totalLeftover -= _amount;
-  storage.set<u32>("totalLeftover", totalLeftover);
+  totalLeftover = u128.sub(totalLeftover, _amount);
+  storage.set<u128>("totalLeftover", totalLeftover);
 }
 
 export function createICO(
   _name: string,
-  _supply: u32,
+  _supply: u128,
   _cliffMonths: u32,
   _vestingMonths: u32,
   _unlockRate: u32,
   _startDate: u64, // second type timestamp
-  _tokenAbsoluteUsdtPrice: u32, //0 if free
+  _tokenAbsoluteUsdtPrice: u128, //0 if free
   _isFree: boolean, //1 if free, 0 if not-free
   _isOnlyWhitelist: boolean //if ico type accepting only whitelisted beneficiary => 1, else => 0
 ): void {
@@ -125,6 +147,7 @@ export function createICO(
 
   var currentTime = _getTimeAsSeconds();
   logging.log(currentTime);
+
   assert(
     _startDate >= currentTime,
     "ERROR at createICO: Start date must be greater than now."
@@ -132,25 +155,18 @@ export function createICO(
 
   if (_isFree == false) {
     assert(
-      _tokenAbsoluteUsdtPrice > 0,
+      _tokenAbsoluteUsdtPrice > u128.Zero,
       "ERROR at createICO: Token price should be bigger than zero."
     );
   } else if (_isFree == true) {
     assert(
-      _tokenAbsoluteUsdtPrice == 0,
+      _tokenAbsoluteUsdtPrice == u128.Zero,
       "ERROR at createICO: Token price should be zero for family sales."
     );
-  } else {
-    logging.log("else");
-    return;
   }
 
-  /*require(
-    totalAllocation + _supply <= token.balanceOf(msg.sender),
-    "ERROR at createICO: Cannot create sale round because not sufficient tokens."
-);
-*/
-  _increaseTotalAllocation(_supply);
+  //(token contract call) supply control, whether exceeded total supply or not
+  ft_total_SupplyCall(_supply);
 
   var newICOData = new ICOData();
   newICOData.ICOname = _name;
@@ -172,9 +188,11 @@ export function createICO(
   _increaseICOindex();
 }
 
-export function buyTokens(_icoType: u32, _usdtAmount: u32): void {
+export function buyTokens(_icoType: u32, _absoluteUsdtAmount: u128): void {
   var icoData = ICODatas.getSome(_icoType);
 
+  logging.log(_icoType);
+  logging.log(_absoluteUsdtAmount);
   assert(
     icoData.IsFree == false,
     "ERROR at buyTokens: This token distribution is exclusive to the team only."
@@ -190,17 +208,21 @@ export function buyTokens(_icoType: u32, _usdtAmount: u32): void {
   var beneficiaryAddress = Context.sender;
   var vestingKeyString = beneficiaryAddress.concat(_icoType.toString());
 
-  assert(
-    isWhitelisted(beneficiaryAddress, _icoType),
-    "ERROR at buyTokens: This token distribution is exclusive to the whitelisted users only."
-  );
+  if (whitelist.contains(_icoType)) {
+    assert(
+      _isWhitelisted(beneficiaryAddress, _icoType),
+      "ERROR at buyTokens: This token distribution is exclusive to the whitelisted users only."
+    );
+  }
 
+  var usdtAmount = u128.div(_absoluteUsdtAmount, u128.from(10 ** 6));
   var tokenAmount = _getTokenAmount(
-    _usdtAmount,
+    _absoluteUsdtAmount,
     icoData.TokenAbsoluteUsdtPrice
   );
+  logging.log(tokenAmount);
 
-  _preValidatePurchase(beneficiaryAddress, tokenAmount, _usdtAmount, _icoType);
+  _preValidatePurchase(beneficiaryAddress, tokenAmount, usdtAmount, _icoType);
 
   if (!isIcoMember.contains(vestingKeyString)) {
     createVestingScheduleCall(
@@ -211,41 +233,41 @@ export function buyTokens(_icoType: u32, _usdtAmount: u32): void {
       icoData.ICOnumberOfVesting,
       icoData.ICOunlockRate,
       true,
-      _usdtAmount,
+      usdtAmount,
       icoData.ICOstartDate,
       icoData.TokenAbsoluteUsdtPrice
     );
     isIcoMember.set(vestingKeyString, true);
 
-    //icoMembers.getSome(_icoType).push(beneficiaryAddress);
-
     var tempMemberArray = icoMembers.getSome(_icoType);
     tempMemberArray.push(beneficiaryAddress);
     icoMembers.set(_icoType, tempMemberArray);
   } else {
-    var totalVestingAllocation =
-      tokenAmount - (icoData.ICOunlockRate * tokenAmount) / 100;
+    var totalVestingAllocation = u128.sub(
+      tokenAmount,
+      u128.div(
+        u128.mul(u128.from(icoData.ICOunlockRate), tokenAmount),
+        u128.from(100)
+      )
+    );
     updateVestingScheduleCall(
       vestingKeyString,
       tokenAmount,
       totalVestingAllocation,
-      _usdtAmount
+      usdtAmount
     );
   }
 
-  _updatePurchasingState(_usdtAmount, tokenAmount, _icoType);
-  _forwardFunds(_usdtAmount);
+  _updatePurchasingState(usdtAmount, tokenAmount, _icoType);
+  //_forwardFunds(_usdtAmount);
 }
 
 //only owner can add team member to vesting schedule
 export function addingTeamMemberToVesting(
   _beneficiary: string,
   _icoType: u32,
-  _tokenAmount: u32
+  _tokenAmount: u128
 ): void {
-  logging.log(Context.usedGas);
-  logging.log(Context.prepaidGas);
-
   _onlyOwner("addingTeamMemberToVesting");
 
   var icoData = ICODatas.getSome(_icoType);
@@ -257,7 +279,7 @@ export function addingTeamMemberToVesting(
 
   var vestingKeyString = _beneficiary.concat(_icoType.toString());
 
-  _preValidatePurchase(_beneficiary, _tokenAmount, 0, _icoType);
+  _preValidatePurchase(_beneficiary, _tokenAmount, u128.Zero, _icoType);
 
   createVestingScheduleCall(
     _beneficiary,
@@ -267,19 +289,17 @@ export function addingTeamMemberToVesting(
     icoData.ICOnumberOfVesting,
     icoData.ICOunlockRate,
     true,
-    0,
+    u128.Zero,
     icoData.ICOstartDate,
-    0
+    u128.Zero
   );
   isIcoMember.set(vestingKeyString, true);
-
-  //icoMembers.getSome(_icoType).push(_beneficiary);
 
   var tempMemberArray = icoMembers.getSome(_icoType);
   tempMemberArray.push(_beneficiary);
   icoMembers.set(_icoType, tempMemberArray);
 
-  _updatePurchasingState(0, _tokenAmount, _icoType);
+  _updatePurchasingState(u128.Zero, _tokenAmount, _icoType);
 }
 
 /*export function changeAbsoluteTokenUsdtPrice(
@@ -306,7 +326,7 @@ export function addToWhitelist(_beneficiaries: string[], _icoType: u32): void {
     "ERROR at addToWhitelist: This sale round is not using whitelist concept."
   );
   for (var x = 0; x < _beneficiaries.length; x++) {
-    addAddressToWhitelist(_beneficiaries[x], _icoType);
+    _addAddressToWhitelist(_beneficiaries[x], _icoType);
   }
 }
 
@@ -315,11 +335,33 @@ export function addToWhitelist(_beneficiaries: string[], _icoType: u32): void {
  */
 //////////////////////////////////////////////////////////////////////////////////////////
 //in vesting contract, after token claims
-export function increaseICOtokenSold(_amount: u32, _icoType: u32): void {
+export function increaseICOtokenSold(_amount: u128, _icoType: u32): void {
   _onlyVestingContract("increaseICOtokenSold");
   var ICOData = ICODatas.getSome(_icoType);
-  ICOData.ICOtokenSold += _amount;
+  ICOData.ICOtokenSold = u128.add(ICOData.ICOtokenSold, _amount);
   ICODatas.set(_icoType, ICOData);
+}
+
+//usdt contractından gelen buytokens isteği burada o fonksiyona yönlendirilecek.
+export function ft_on_transfer(
+  sender_id: string,
+  amount: string,
+  msg: string
+): void {
+  //bu fonksiyon yalnızca usdt contractı tarafından çağrılmalı.
+  logging.log(Context.sender);
+  logging.log(Context.predecessor);
+  logging.log(sender_id);
+  logging.log(amount);
+  logging.log(msg);
+  logging.log(msg.split("-")[0]); //func
+  logging.log(msg.split("-")[1]); //icotype
+  if (msg.split("-")[0] == "buytokens") {
+    buyTokens(u32(parseInt(msg.split("-")[1])), u128.from(parseInt(amount)));
+    //var unusedAmount: Uint8Array=new Uint8Array();
+    //return new ContractPromiseResult(1,unusedAmount);
+  }
+  //return new ContractPromiseResult(0,amount);
 }
 
 /**
@@ -334,6 +376,7 @@ export function getIcoMembers(_icoType: u32): Array<string> {
   return icoMembers.getSome(_icoType);
 }
 export function getWhitelistOfRound(_icoType: u32): Array<string> {
+  _onlyOwner("getWhitelistOfRound");
   assert(
     ICODatas.contains(_icoType),
     "ERROR at getWhitelistOfRound: There is no sale round with this index."
@@ -367,12 +410,12 @@ export function getICODetails(_ICOindex: u32): void {
   logging.log(ICOData.IsFree.toString());
   logging.log(ICOData.isOnlyWhitelist.toString());
 }
-export function getTotalAllocation(): u32 {
-  return storage.getPrimitive<u32>("totalAllocation", 0);
+export function getTotalAllocation(): u128 {
+  return storage.getSome<u128>("totalAllocation");
 }
-export function getLeftover(): u32 {
+export function getLeftover(): u128 {
   _onlyOwner("getLeftover");
-  return storage.getPrimitive<u32>("totalLeftover", 0);
+  return storage.getSome<u128>("totalLeftover");
 }
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -380,10 +423,12 @@ export function getLeftover(): u32 {
  * @UTILS
  */
 //////////////////////////////////////////////////////////////////////////////////////////
-function _increaseTotalAllocation(addToAllocation: u32): void {
-  const totalAllocationValue =
-    storage.getPrimitive<u32>("totalAllocation", 0) + addToAllocation;
-  storage.set<u32>("totalAllocation", totalAllocationValue);
+function _increaseTotalAllocation(addToAllocation: u128): void {
+  const totalAllocationValue = u128.add(
+    storage.getSome<u128>("totalAllocation"),
+    addToAllocation
+  );
+  storage.set<u128>("totalAllocation", totalAllocationValue);
 }
 
 function _increaseICOindex(): void {
@@ -399,42 +444,57 @@ function _getTimeAsSeconds(): u64 {
   return Context.blockTimestamp / 10 ** 9;
 }
 
-function _getTokenAmount(_usdtAmount: u32, _absoluteUsdtPrice: u32): u32 {
-  var absoluteUsdtAmount = _usdtAmount * 10 ** 6;
-  return absoluteUsdtAmount / _absoluteUsdtPrice;
+function _getTokenAmount(
+  _absoluteUsdtAmount: u128,
+  _absoluteUsdtPrice: u128
+): u128 {
+  //logging.log(_usdtAmount);
+  //var absoluteUsdtAmount = u128.mul(_usdtAmount, u128.from(10 ** 6));
+  logging.log(_absoluteUsdtAmount);
+  logging.log(u128.div(_absoluteUsdtAmount, _absoluteUsdtPrice));
+  return u128.div(_absoluteUsdtAmount, _absoluteUsdtPrice);
 }
 
 function _preValidatePurchase(
   _beneficiary: string,
-  _tokenAmount: u32,
-  _usdtAmount: u32,
+  _tokenAmount: u128,
+  _usdtAmount: u128,
   _icoType: u32
 ): void {
-  assert(_tokenAmount > 0, "ERROR at _preValidatePurchase: Token amount is 0.");
+  assert(
+    _tokenAmount > u128.Zero,
+    "ERROR at _preValidatePurchase: Token amount is 0."
+  );
 
   var ICOData = ICODatas.getSome(_icoType);
   if (!ICOData.IsFree) {
-    //beneficiary nin yeterli usdtsi var mı ?
+    //bunun doğrulaması zaten token contractonda ft_transfer_call fonksiyonunun başında yapılıyor
+    //USDT_balance_ofCall(_beneficiary, _usdtAmount);
   }
 
   assert(
-    ICOData.ICOtokenAllocated + _tokenAmount <= ICOData.ICOsupply,
+    u128.add(ICOData.ICOtokenAllocated, _tokenAmount) <= ICOData.ICOsupply,
     "ERROR at _preValidatePurchase: Not enough token in the ICO supply"
   );
 }
 
 function _updatePurchasingState(
-  _usdtAmount: u32,
-  _tokenAmount: u32,
+  _usdtAmount: u128,
+  _tokenAmount: u128,
   _icoType: u32
 ): void {
   var ICOData = ICODatas.getSome(_icoType);
-  ICOData.ICOtokenAllocated += _tokenAmount;
-  ICOData.ICOusdtRaised += _usdtAmount;
+  ICOData.ICOtokenAllocated = u128.add(ICOData.ICOtokenAllocated, _tokenAmount);
+  ICOData.ICOusdtRaised = u128.add(ICOData.ICOusdtRaised, _usdtAmount);
   ICODatas.set(_icoType, ICOData);
 }
 
-function _forwardFunds(usdtAmount: u32): void {
+function _forwardFunds(usdtAmount: u128): void {
+  //bu fonksiyon yerine zaten buyerin usdt contractına attığı
+  //ft_transfer_call fonksiyonu sayesinde usdt depositini yapıyor,
+  //ardından msg içinde gerekli parametrelere göre crowdsale
+  //buytokens call ediliyor
+  //alttakiler geçersiz
   //usdt.transferFrom(msg.sender, usdtWallet, usdtAmount);
   //contract promise to usdt contract
 }
@@ -455,9 +515,9 @@ function _onlyVestingContract(funcName: string): void {
     funcName + "method is private. Only vesting contract call this function."
   );
 }
-function addAddressToWhitelist(_beneficiary: string, _icoType: u32): void {
+function _addAddressToWhitelist(_beneficiary: string, _icoType: u32): void {
   assert(
-    !isWhitelisted(_beneficiary, _icoType),
+    !_isWhitelisted(_beneficiary, _icoType),
     "ERROR at addAddressToWhitelist: Already whitelisted."
   );
 
@@ -466,7 +526,7 @@ function addAddressToWhitelist(_beneficiary: string, _icoType: u32): void {
   whitelist.set(_icoType, tempWhitelistArray);
 }
 
-function isWhitelisted(_beneficiary: string, _icoType: u32): bool {
+function _isWhitelisted(_beneficiary: string, _icoType: u32): bool {
   var tempWhitelistArray = whitelist.getSome(_icoType);
   return tempWhitelistArray.includes(_beneficiary);
 }
@@ -480,18 +540,18 @@ function isWhitelisted(_beneficiary: string, _icoType: u32): bool {
 class updateVestingScheduleCallArgs {
   constructor(
     public _vestingKeyString: string,
-    public _tokenAmount: u32,
-    public _totalVestingAllocation: u32,
-    public _usdtAmount: u32
+    public _tokenAmount: u128,
+    public _totalVestingAllocation: u128,
+    public _usdtAmount: u128
   ) {}
 }
 
 //updating specific vestingschedule struct
 function updateVestingScheduleCall(
   _vestingKeyString: string,
-  _tokenAmount: u32,
-  _totalVestingAllocation: u32,
-  _usdtAmount: u32
+  _tokenAmount: u128,
+  _totalVestingAllocation: u128,
+  _usdtAmount: u128
 ): void {
   assert(
     Context.prepaidGas >= 20 * TGAS,
@@ -553,28 +613,28 @@ class createVestingScheduleCallArgs {
   constructor(
     public _beneficiaryAddress: string,
     public _icoType: u32,
-    public _allocation: u32,
+    public _allocation: u128,
     public _numberOfCliffMonths: u32,
     public _numberOfVestingMonths: u32,
     public _unlockRate: u32,
     public _isRevocable: boolean,
-    public _investedUsdt: u32,
+    public _investedUsdt: u128,
     public _icoStartDate: u64,
-    public _tokenAbsoluteUsdtPrice: u32
+    public _tokenAbsoluteUsdtPrice: u128
   ) {}
 }
 
 function createVestingScheduleCall(
   _beneficiaryAddress: string,
   _icoType: u32,
-  _allocation: u32,
+  _allocation: u128,
   _numberOfCliffMonths: u32,
   _numberOfVestingMonths: u32,
   _unlockRate: u32,
   _isRevocable: boolean,
-  _investedUsdt: u32,
+  _investedUsdt: u128,
   _icoStartDate: u64,
-  _tokenAbsoluteUsdtPrice: u32
+  _tokenAbsoluteUsdtPrice: u128
 ): void {
   assert(
     Context.prepaidGas >= 20 * TGAS,
@@ -636,8 +696,6 @@ export function createVestingScheduleCallCallback(): bool {
 }
 ////////////////////////////////////////////////////////////////////////////////////
 
-//////////////////////////////////////////////////////////////////////////////////////////
-
 //changeIcoStateInVestingCall vesting contractında ico roundlarının stateini değiştirir
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -693,4 +751,88 @@ export function changeIcoStateInVestingCallCallback(): bool {
     logging.log("basarisiz changeIcoStateInVestingCall");
   }
   return response.status ? true : false;
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+//ft_total_SupplyCallCallback: yeni ico yaratımında token supply aşılırsa işlemi gerçekleştirmeden assert atacak
+//ft_total_SupplyCall
+////////////////////////////////////////////////////////////////////////////////////
+
+@nearBindgen
+class ft_total_SupplyCallCallbackArgs {
+  constructor(public new_round_supply: u128) {}
+}
+function ft_total_SupplyCall(new_round_supply: u128): void {
+  assert(Context.prepaidGas >= 20 * TGAS, "Please attach at least 20 Tgas");
+  const tokenContractAddress: string = storage.getPrimitive<string>(
+    "token-address",
+    ""
+  );
+  const promise: ContractPromise = ContractPromise.create(
+    tokenContractAddress,
+    "ft_total_supply",
+    "{}",
+    5 * TGAS,
+    NO_DEPOSIT
+  );
+
+  const args: ft_total_SupplyCallCallbackArgs =
+    new ft_total_SupplyCallCallbackArgs(new_round_supply);
+
+  // Create a promise to callback, needs 5 Tgas
+  const callbackPromise = promise.then(
+    Context.contractName,
+    "ft_total_SupplyCallCallback",
+    args,
+    5 * TGAS,
+    NO_DEPOSIT
+  );
+
+  callbackPromise.returnAsResult();
+}
+// Public callback
+export function ft_total_SupplyCallCallback(new_round_supply: u128): void {
+  _onlyOwner("ft_total_SupplyCallCallback");
+
+  const results = ContractPromise.getResults();
+  assert(results.length == 1, "This is a callback method");
+
+  const response = results[0];
+
+  const totalTokenAllocation = storage.getSome<u128>("totalAllocation");
+  const absoluteTotalTokenAllocation = u128.mul(
+    totalTokenAllocation,
+    u128.from(10 ** 6)
+  );
+
+  if (response.status == XCC_SUCCESS) {
+    const absoulute_new_round_supply = u128.mul(
+      new_round_supply,
+      u128.from(10 ** 6)
+    );
+
+    const absouluteTotalTokenSupply: u128 = decode<u128>(response.buffer);
+
+    logging.log(
+      "Total token supply is : " + absouluteTotalTokenSupply.toString()
+    );
+    logging.log(
+      "Total new round supply is : " + absoulute_new_round_supply.toString()
+    );
+    logging.log(
+      "Total token allocation is : " + absoluteTotalTokenAllocation.toString()
+    );
+    assert(
+      u128.add(absoluteTotalTokenAllocation, absoulute_new_round_supply) <=
+        absouluteTotalTokenSupply,
+      "ERROR at createICO: Cannot create sale round because not sufficient tokens."
+    );
+    _increaseTotalAllocation(new_round_supply);
+  } else {
+    assert(
+      false,
+      "ERROR at ft_total_SupplyCallCallback: Response status is failed."
+    );
+  }
 }
